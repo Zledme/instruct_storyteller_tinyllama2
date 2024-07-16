@@ -8,8 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.utils import parametrize
-
 
 @dataclass
 class ModelArgs:
@@ -40,20 +38,67 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
+class RoMaFunctions:
+    @staticmethod
+    def e_to_q(roll, pitch, yaw):
+        cy = torch.cos(yaw * 0.5)
+        sy = torch.sin(yaw * 0.5)
+        cp = torch.cos(pitch * 0.5)
+        sp = torch.sin(pitch * 0.5)
+        cr = torch.cos(roll * 0.5)
+        sr = torch.sin(roll * 0.5)
+    
+        w = cr * cp * cy - sr * sp * sy
+        x = sr * cp * cy + cr * sp * sy
+        y = cr * sp * cy - sr * cp * sy
+        z = cr * cp * sy + sr * sp * cy
+    
+        return torch.stack([w, x, y, z], dim=0)
+
+    @staticmethod
+    def quat_conj(quaternion):
+        return torch.stack([quaternion[0], -quaternion[1], -quaternion[2], -quaternion[3]], dim=0)
+
+    @staticmethod
+    def quaternion_multiply(q1, q2):
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+
+        w_res = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x_res = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y_res = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z_res = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+        return torch.stack([w_res, x_res, y_res, z_res], dim=0)
+
+    @staticmethod
+    def qvq_multiply(quaternion, a, b, c):
+        v_quaternion = torch.stack([ torch.zeros_like(a), a,b,c], dim = 0)
+        q_conjugate = RoMaFunctions.quat_conj(quaternion)
+        intermediate = RoMaFunctions.quaternion_multiply(quaternion, v_quaternion)
+        rotated_vector_quaternion = RoMaFunctions.quaternion_multiply(intermediate, q_conjugate)
+        # breakpoint()
+        x_res, y_res, z_res = rotated_vector_quaternion[1:]
+
+        return torch.stack([x_res, y_res, z_res], dim = -1).flatten(3)
+
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 3)[: (dim // 3)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
     freqs_cos = torch.cos(freqs)  # real part
     freqs_sin = torch.sin(freqs)  # imaginary part
-    return freqs_cos, freqs_sin
+    return freqs, freqs
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
+    # breakpoint()
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(shape)
+
 
 def apply_rotary_emb(
     xq: torch.Tensor,
@@ -62,26 +107,26 @@ def apply_rotary_emb(
     freqs_sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-    # reshape xq and xk to match the complex representation
-    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
-
+    xq_a, xq_b, xq_c = xq.float().reshape(xq.shape[:-1] + (-1, 3)).unbind(-1)
+    xk_a, xk_b, xk_c = xk.float().reshape(xk.shape[:-1] + (-1, 3)).unbind(-1)
+ 
     # reshape freqs_cos and freqs_sin for broadcasting
-    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
-    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
+    freqs = reshape_for_broadcast(freqs_cos, xq_a)
+    # freqs_sin = reshape_for_broadcast(freqs_sin, xq_a)
 
-    # apply rotation using real numbers
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
-
-    # flatten last two dimensions
-    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
-    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
-
+    rot_axis = torch.tensor([1.0], device=freqs.device) / torch.sqrt(torch.tensor(3.0))
+    axis = rot_axis / torch.norm(rot_axis, dim=-1, keepdim=True)
+    half_angle = freqs / 2.0
+    sin_half = torch.sin(half_angle)
+    # return torch.cat([torch.cos(half_angle), axis * sin_half], dim=-1)
+    quaternion = torch.stack([torch.cos(half_angle), rot_axis * sin_half, rot_axis * sin_half, rot_axis * sin_half], dim=0)
+    
+    # quaternion = RoMaFunctions.e_to_q(half_angle, half_angle, half_angle)
+    
+    xq_out = RoMaFunctions.qvq_multiply(quaternion, xq_a, xq_b, xq_c)
+    xk_out = RoMaFunctions.qvq_multiply(quaternion, xk_a, xk_b, xk_c)
     return xq_out.type_as(xq), xk_out.type_as(xk)
-
+    
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -126,13 +171,14 @@ class Attention(nn.Module):
         freqs_sin: torch.Tensor,
     ):
         bsz, seqlen, _ = x.shape
-
+        
         # QKV
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
+        #breakpoint()
         # RoPE relative positional embeddings
         xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
@@ -147,6 +193,7 @@ class Attention(nn.Module):
 
         # flash implementation
         if self.flash:
+            # breakpoint()
             output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             # manual implementation
@@ -248,11 +295,7 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(
-            self,
-            tokens: torch.Tensor,
-            #targets: Optional[torch.Tensor] = None
-            ) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
@@ -263,8 +306,90 @@ class Transformer(nn.Module):
             h = layer(h, freqs_cos, freqs_sin)
         h = self.norm(h)
 
-        logits = self.output(h)
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.output(h)
+            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the output on the very last position
+            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            self.last_loss = None
+
         return logits
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        N = sum(p.numel() for p in self.parameters())
+        cfg = self.params
+        L, H, Q, T = cfg.n_layers, cfg.n_heads, cfg.dim//cfg.n_heads, cfg.max_seq_len
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0/dt) # per second
+        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
+        return mfu
+
+    @torch.inference_mode()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Also note this is a super inefficient version of sampling with no key/value cache.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
+            # forward the model to get the logits for the index in the sequence
+            logits = self(idx_cond)
+            logits = logits[:, -1, :] # crop to just the final time step
+            if temperature == 0.0:
+                # "sample" the single most likely index
+                _, idx_next = torch.topk(logits, k=1, dim=-1)
+            else:
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
 
 class LoraLinear(nn.Module):
     """
