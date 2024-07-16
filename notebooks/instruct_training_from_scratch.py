@@ -140,8 +140,8 @@ print(f'Number of parameters: {sum(p.nelement() for p in model.parameters())}')
 batch_size = 32
 
 wanted_batch_size = 4 * 128
-gradient_accumulation_steps = wanted_batch_size // batch_size
-
+# gradient_accumulation_steps = wanted_batch_size // batch_size
+gradient_accumulation_steps = 1
 print(f'Wanted batch_size: {wanted_batch_size}, gradient accumulation steps: {gradient_accumulation_steps}, batch_size: {batch_size}')
 
 
