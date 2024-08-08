@@ -10,9 +10,9 @@ from tokenizer import Tokenizer
 
 tokenizer_path = './tokenizer.model'
 
-checkpoint_path = '../models/lora_story_teller_110M.pt'
+checkpoint_path = './ckpt.pt'
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 
 def remove_unwanted_prefix_from_state_dict(state_dict, unwanted_prefix):
@@ -48,7 +48,9 @@ def generate_paragraph(
     prompt,
     max_new_tokens=400,
     temperature=0.1,
-    top_k=10
+    top_k=10,
+    repetition_penalty=1.2,
+    no_repeat_ngram_size=2
 ):
     tokenized_prompt = tokenizer.encode(prompt, bos=True, eos=False)
     tokenized_prompt = (torch.tensor(tokenized_prompt, dtype=torch.long, device=device)[None, ...])
@@ -60,14 +62,33 @@ def generate_paragraph(
         output = model(context_tokens)
         logits = output[:, -1, :]
         logits = logits / temperature
-        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-        logits[logits < v[:, [-1]]] = -float('Inf')
+
+        for token_id in set(paragraph):
+            logits[:, token_id] /= repetition_penalty
+
+        if no_repeat_ngram_size > 0:
+            generated_ngrams = [tuple(paragraph[i:i+no_repeat_ngram_size]) for i in range(len(paragraph) - no_repeat_ngram_size + 1)]
+            for ngram in generated_ngrams:
+                ngram_token_ids = torch.tensor([ngram], dtype=torch.long, device=device)
+                if context_tokens.size(1) >= ngram_token_ids.size(1) and (context_tokens[:, -ngram_token_ids.size(1):] == ngram_token_ids).all(dim=1).any():
+                    for token_id in ngram:
+                        logits[:, token_id] /= repetition_penalty
+
+
+
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
+        #print("next::::::", next_)
+        
         context_tokens = torch.cat((context_tokens, next_token), dim=1)
         paragraph.append(next_token.item())
-        # if next_token.item() == tokenizer.eos_id() or tokenizer.decode(paragraph[-3:]) == 'The end.':
-        #     break
+
+        print(tokenizer.decode(next_token.item()), end=" ")
+        if next_token.item() == tokenizer.eos_id() or tokenizer.decode(paragraph[-3:]) == 'The end.':
+            break
     return context_tokens, paragraph, tokenizer.decode(paragraph)
 
 parser = argparse.ArgumentParser(description="Generate a story")
@@ -76,6 +97,9 @@ parser.add_argument("--model_path", type=str, required=True, help="Path to the m
 parser.add_argument("--prompt", type=str, required=True, help="Prompt for generating the story")
 parser.add_argument("--temperature", type=float, default=0.5, help="Temperature for controlling randomness")
 parser.add_argument("--top_k", type=int, default=10, help="Number of top-k candidates to consider")
+parser.add_argument("--repetition_penalty", type=float, default=1.2, help="Penalty for repeated tokens")
+parser.add_argument("--no_repeat_ngram_size", type=int, default=2, help="Size of n-grams that should not be repeated")
+
 
 args = parser.parse_args()
 
@@ -85,12 +109,15 @@ instruct_model, ckpt = load_model(
     device=device,
 )
 
-_, tokens, paragraph = generate_paragraph(
-    model=instruct_model, 
+generate_paragraph(
+    model=instruct_model,
     prompt=args.prompt,
     max_new_tokens=400,
-    temperature=0.1,
-    top_k=10
+    temperature=args.temperature,
+    top_k=args.top_k,
+    repetition_penalty=args.repetition_penalty,
+    no_repeat_ngram_size=args.no_repeat_ngram_size
 )
-print(paragraph)
+
+
 
