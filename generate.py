@@ -22,7 +22,7 @@ def remove_unwanted_prefix_from_state_dict(state_dict, unwanted_prefix):
     return state_dict
 
 
-def load_model(checkpoint_path, device, unwanted_prefix='_orig_mod'):
+def load_model(checkpoint_path, device, unwanted_prefix='_orig_mod.'):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint['model_args'] if isinstance(checkpoint['model_args'], ModelArgs) else ModelArgs(**checkpoint['model_args'])
     model = Transformer(config)
@@ -83,7 +83,6 @@ tokenizer = Tokenizer(tokenizer_path)
 instruct_model, ckpt = load_model(
     checkpoint_path=args.model_path,
     device=device,
-    unwanted_prefix='',
 )
 
 _, tokens, paragraph = generate_paragraph(
