@@ -5,6 +5,8 @@ from sentencepiece import SentencePieceProcessor
 from model import *
 import torch.nn.functional as F
 import argparse
+from tokenizer import Tokenizer
+
 
 tokenizer_path = './tokenizer.model'
 
@@ -48,7 +50,7 @@ def generate_paragraph(
     temperature=0.1,
     top_k=10
 ):
-    tokenized_prompt = [tokenizer.bos_id()] + tokenizer.encode(prompt)
+    tokenized_prompt = tokenizer.encode(prompt, bos=True, eos=False)
     tokenized_prompt = (torch.tensor(tokenized_prompt, dtype=torch.long, device=device)[None, ...])
 
     paragraph = []
@@ -64,8 +66,8 @@ def generate_paragraph(
         next_token = torch.multinomial(probs, num_samples=1)
         context_tokens = torch.cat((context_tokens, next_token), dim=1)
         paragraph.append(next_token.item())
-        if next_token.item() == tokenizer.eos_id() or tokenizer.decode(paragraph[-3:]) == 'The end.':
-            break
+        # if next_token.item() == tokenizer.eos_id() or tokenizer.decode(paragraph[-3:]) == 'The end.':
+        #     break
     return context_tokens, paragraph, tokenizer.decode(paragraph)
 
 parser = argparse.ArgumentParser(description="Generate a story")
@@ -77,7 +79,7 @@ parser.add_argument("--top_k", type=int, default=10, help="Number of top-k candi
 
 args = parser.parse_args()
 
-tokenizer = SentencePieceProcessor(model_file=tokenizer_path)
+tokenizer = Tokenizer(tokenizer_path)
 instruct_model, ckpt = load_model(
     checkpoint_path=args.model_path,
     device=device,
